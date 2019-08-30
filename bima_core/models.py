@@ -4,6 +4,8 @@ import os
 import six
 import subprocess
 
+from os.path import splitext
+
 from categories.models import CategoryBase
 from constance import config
 from django.conf import settings
@@ -505,7 +507,12 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
     @property
     def image_file(self):
         try:
-            return self.image.url
+            return self.image.storage.url(self.image.name,
+                                          parameters={
+                                              'ResponseContentDisposition': 'filename={}'.format(
+                                                  self.get_download_filename()
+                                              )
+                                          })
         except ValueError:
             # the 'image' attribute has no file associated with it
             return ''
@@ -514,6 +521,26 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
     def image_flickr(self):
         if self.flickr_id and self.flickr_username:
             return build_absolute_uri(config.FLICKR_PHOTO_URL, '', args=[self.flickr_username, self.flickr_id, ])
+
+    def get_download_filename(self, extension='.jpg'):
+        """
+        Returns the filename
+        :param self: file instance
+        :param extension: default extension
+        :return: complete filename with extension
+        """
+        filename = ""
+
+        if self.original_file_name:
+            name, extension = splitext(self.original_file_name)
+        else:
+            name = slugify(self.description_ca) or slugify(self.title_ca)
+            name = slugify(name)
+
+        if name:
+            filename = "{}{}".format(name, extension)
+
+        return filename
 
     def _generate_url(self, width=None, height=None, smart=False, fit_in=False, fill_colour=None, auto_resize=False):
         if self.is_photo:
