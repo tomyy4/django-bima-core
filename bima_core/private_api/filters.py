@@ -290,7 +290,7 @@ class PhotoSearchFilter(filters.FilterSet):
             search = self._get_operation_filter(search, operator)(categorized_value)
 
         # return only active photos
-        search = self._get_operation_filter(search, Q.AND)(('is_active', 'True'))
+        search = self._get_operation_filter(search, Q.AND)(('is_active', 'true'))
 
         return search
 
