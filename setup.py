@@ -22,7 +22,7 @@ INSTALL_REQUIRES = [
     'django-taggit==1.2.0',
     'django-thumbor>=0.5.6,<0.6',
     'django-yubin>=1.6.0,<2',
-    'django_categories==1.8',
+    'django_categories==2.0.0',
     'djangorestframework-recursive==0.1.2',
     'djangorestframework==3.12.2',
     'drf-chunked-upload==0.4.2',
