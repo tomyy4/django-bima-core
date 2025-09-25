@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
+import logging
+import os
+import six
+import subprocess
+
 from categories.models import CategoryBase
 from constance import config
 from django.conf import settings
+from django.contrib.gis.db.models import PointField
+from django.contrib.gis.geos import Point
 from django.db import models
+from django.core.files.base import File
 from django.utils.text import slugify
 from django.utils.timezone import now
 from django.utils.translation import ugettext_lazy as _, ugettext as _i
@@ -10,10 +18,12 @@ from django.contrib.auth.models import AbstractUser, Group as _Group
 from django_thumbor import generate_url
 from drf_chunked_upload.models import ChunkedUpload
 from exifread import process_file
+from geoposition import Geoposition
 from geoposition.fields import GeopositionField
 from hashfs import HashFS
 from taggit.managers import TaggableManager
 from taggit.models import GenericTaggedItemBase, Tag
+
 from .fields import LanguageField
 from .managers import TaxonomyManager, PhotoChunkedManager, KeywordManager, AlbumManager, PhotoManager, UserManager
 from .permissions import UserPermissionMixin, AlbumPermissionMixin, PhotoPermissionMixin, \
@@ -21,9 +31,8 @@ from .permissions import UserPermissionMixin, AlbumPermissionMixin, PhotoPermiss
     GroupPermissionMixin, PhotoChunkPermissionMixin, RightPermissionMixin, ReadPermissionMixin
 from .utils import idpath, get_exif_info, get_exif_datetime, get_exif_longitude, get_exif_latitude, \
     get_exif_altitude, build_absolute_uri
-import logging
-import os
-import six
+from .filetypes import FileType
+
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +137,8 @@ class Group(GroupPermissionMixin, _Group):
 
     class Meta:
         proxy = True
+        verbose_name = _('Group')
+        verbose_name_plural = _('Groups')
 
 
 class User(UserPermissionMixin, SoftDeleteModelMixin, AbstractUser):
@@ -142,6 +153,8 @@ class User(UserPermissionMixin, SoftDeleteModelMixin, AbstractUser):
 
     class Meta:
         ordering = ('is_active', 'username', 'date_joined', )
+        verbose_name = _('User')
+        verbose_name_plural = _('Users')
 
 
 class TaggedKeyword(GenericTaggedItemBase, ReadPermissionMixin):
@@ -152,7 +165,7 @@ class TaggedKeyword(GenericTaggedItemBase, ReadPermissionMixin):
     """
 
     language = LanguageField(default=settings.LANGUAGE_CODE)
-    tag = models.ForeignKey(Tag, related_name="%(app_label)s_%(class)s_tags")
+    tag = models.ForeignKey(Tag, related_name="%(app_label)s_%(class)s_tags", on_delete=models.RESTRICT)
 
     class Meta:
         unique_together = ('object_id', 'tag', 'language', )
@@ -165,7 +178,7 @@ class TaggedName(GenericTaggedItemBase, ReadPermissionMixin):
     through the model this would not overwritten it.
     """
 
-    tag = models.ForeignKey(Tag, related_name="%(app_label)s_%(class)s_tags")
+    tag = models.ForeignKey(Tag, related_name="%(app_label)s_%(class)s_tags", on_delete=models.RESTRICT)
 
 
 class PhotoType(ReadPermissionMixin, models.Model):
@@ -191,7 +204,8 @@ class Album(AlbumPermissionMixin, SoftDeleteModelMixin, models.Model):
     title = models.CharField(max_length=128, verbose_name=_('Title'))
     description = models.TextField(verbose_name=_('Description'))
     slug = models.SlugField(unique=True)
-    cover = models.ForeignKey('Photo', blank=True, null=True, verbose_name=_('Cover'), related_name='covers_album')
+    cover = models.ForeignKey('Photo', blank=True, null=True, verbose_name=_('Cover'), related_name='covers_album',
+                              on_delete=models.RESTRICT)
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Creation date'))
@@ -307,6 +321,10 @@ class PhotoExif(models.Model):
         label = label or self.pk
         return _i("{} exif".format(label))
 
+    class Meta:
+        verbose_name = _('PhotoExif')
+        verbose_name_plural = _('PhotoExifs')
+
 
 class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
     """
@@ -332,12 +350,18 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
         (UPLOADED, _('Uploaded')),
     )
 
-    def image_path(instance, filename):
+    def generic_path(instance, filename, root, field_name):
         basename, ext = os.path.splitext(filename)
-        fs = HashFS('photos', depth=4, width=2, algorithm='sha256')
-        stream = getattr(instance, 'image').chunks()
+        fs = HashFS(root, depth=4, width=2, algorithm='sha256')
+        stream = getattr(instance, field_name).chunks()
         id = fs.computehash(stream)
-        return idpath(fs, id, extension=ext)
+        return idpath(fs, root, id, extension=ext)
+
+    def image_path(instance, filename):
+        return instance.generic_path(filename, root='photos', field_name='image')
+
+    def video_thumbnail_path(instance, filename):
+        return instance.generic_path(filename, root='video_thumbnails', field_name='video_thumbnail')
 
     # new fields
     identifier = models.CharField(max_length=50, verbose_name=_('Identifier'), blank=True, default='')
@@ -353,6 +377,7 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
 
     # Location
     position = GeopositionField(null=True, blank=True)
+    point = PointField(null=True, blank=True)
     province = models.CharField(max_length=100, verbose_name=_('Province'), blank=True, default='')
     municipality = models.CharField(max_length=100, verbose_name=_('Municipality'), blank=True, default='')
     district = models.CharField(max_length=200, blank=True, default='', verbose_name=_('District'))
@@ -372,31 +397,43 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
     altitude = models.FloatField(default=0, verbose_name=_('Exif altitude'))
 
     # Readable auto-loaded photo exif
-    exif = models.OneToOneField(PhotoExif, blank=True, null=True, verbose_name=_('EXIF'))
+    exif = models.OneToOneField(PhotoExif, blank=True, null=True, verbose_name=_('EXIF'), on_delete=models.RESTRICT)
 
     # copyrights
     author = models.ForeignKey(PhotoAuthor, blank=True, null=True, verbose_name=_('Author'),
-                               related_name='author_photos')
+                               related_name='author_photos', on_delete=models.RESTRICT)
     copyright = models.ForeignKey(Copyright, blank=True, null=True, verbose_name=_('Copyright'),
-                                  related_name='copyright_photos')
+                                  related_name='copyright_photos', on_delete=models.RESTRICT)
     internal_usage_restriction = models.ForeignKey(UsageRight, blank=True, null=True,
                                                    verbose_name=_('Internal usage restriction'),
-                                                   related_name='internal_usage_restriction_photos')
+                                                   related_name='internal_usage_restriction_photos',
+                                                   on_delete=models.RESTRICT)
     external_usage_restriction = models.ForeignKey(UsageRight, blank=True, null=True,
                                                    verbose_name=_('External usage restriction'),
-                                                   related_name='external_usage_restriction_photos')
+                                                   related_name='external_usage_restriction_photos',
+                                                   on_delete=models.RESTRICT)
 
     # extra info
     flickr_id = models.CharField(max_length=50, blank=True, default='', verbose_name=_('Flickr id'))
     flickr_username = models.CharField(max_length=50, blank=True, default='', verbose_name=_('Flickr username'))
-    owner = models.ForeignKey(User, verbose_name=_('Owner'), related_name='photos')
+    owner = models.ForeignKey(User, verbose_name=_('Owner'), related_name='photos', on_delete=models.RESTRICT)
     photo_type = models.ForeignKey(PhotoType, null=True, blank=True, on_delete=models.SET_NULL,
                                    verbose_name=_('Type'), related_name='photos_type')
     categories = models.ManyToManyField('DAMTaxonomy', blank=True, related_name='taxonomy_photos')
     keywords = TaggableManager(blank=True, through=TaggedKeyword, manager=KeywordManager, verbose_name=_('Keywords'),
                                related_name='keyword_photos')
     names = TaggableManager(blank=True, through=TaggedName, verbose_name=_('Names'), related_name='name_photos')
-    album = models.ForeignKey(Album, verbose_name=_('Album'), related_name='photos_album')
+    album = models.ForeignKey(Album, verbose_name=_('Album'), related_name='photos_album', on_delete=models.RESTRICT)
+
+    # video and audio info
+    youtube_code = models.CharField(_('YouTube code'), max_length=100, blank=True)
+    vimeo_code = models.CharField(_('Vimeo code'), max_length=100, blank=True)
+    soundcloud_code = models.CharField(_('SoundCloud code'), max_length=100, blank=True)
+    video_thumbnail = models.ImageField(upload_to=video_thumbnail_path,
+                                        max_length=200,
+                                        blank=True,
+                                        null=True,
+                                        verbose_name=_('Video thumbnail'))
 
     # Timestamp meta information
     is_active = models.BooleanField(default=True)
@@ -408,6 +445,26 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
 
     def __str__(self):
         return self.title
+
+    @property
+    def is_video(self):
+        return FileType.get_url_file_type(self.image_file) == FileType.video
+
+    @property
+    def is_audio(self):
+        return FileType.get_url_file_type(self.image_file) == FileType.audio
+
+    @property
+    def is_photo(self):
+        return FileType.get_url_file_type(self.image_file) == FileType.photo
+
+    @property
+    def is_file(self):
+        return FileType.get_url_file_type(self.image_file) == FileType.file
+
+    @property
+    def file_type(self):
+        return FileType.get_url_file_type(self.image_file).name
 
     @property
     def is_horizontal(self):
@@ -450,7 +507,11 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
 
     @property
     def image_file(self):
-        return getattr(self.image, 'url', '')
+        try:
+            return self.image.url
+        except ValueError:
+            # the 'image' attribute has no file associated with it
+            return ''
 
     @property
     def image_flickr(self):
@@ -458,7 +519,12 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
             return build_absolute_uri(config.FLICKR_PHOTO_URL, '', args=[self.flickr_username, self.flickr_id, ])
 
     def _generate_url(self, width=None, height=None, smart=False, fit_in=False, fill_colour=None, auto_resize=False):
-        image_url = "{}/{}".format(getattr(settings, 'AWS_LOCATION', ''), self.image.name).strip('/')
+        if self.is_photo:
+            image_url = "{}/{}".format(getattr(settings, 'AWS_LOCATION', ''), self.image.name).strip('/')
+        elif self.is_video and self.video_thumbnail:
+            image_url = "{}/{}".format(getattr(settings, 'AWS_LOCATION', ''), self.video_thumbnail.name).strip('/')
+        else:
+            return ''
 
         # set the correct orientation if force not to be auto-cropped
         size = [width, height]
@@ -506,14 +572,16 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
         Continue if saving image content although get some error extracting it
         """
         # do not extracting metadata while does not image exists
-        if not self.image:
+        if not self.image_file:
             return
+
         # get image metadata
         metadata = {
             'width': self.image.width or 0,
             'height': self.image.height or 0,
             'size': self.image.size,
         }
+
         # get exif of image file
         if with_exif:
             try:
@@ -521,7 +589,7 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
                 if exif_info:
                     metadata.update({
                         'exif_date': get_exif_datetime(exif_info, 'EXIF DateTimeOriginal'),
-                        'camera_model': get_exif_info(exif_info, 'Image Model', default=''),
+                        'camera_model': get_exif_info(exif_info, 'Image Model', default='')[:50],
                         'orientation': get_exif_info(exif_info, 'Image Orientation'),
                         'longitude': get_exif_longitude(exif_info, 'GPS GPSLongitude'),
                         'latitude': get_exif_latitude(exif_info, 'GPS GPSLatitude'),
@@ -529,6 +597,7 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
                     })
             except Exception as exc:
                 logger.error("Error processing exif from {} photo\n\n{}".format(self.title, exc), exc_info=True)
+
         return metadata
 
     def set_metadata(self, only_readable=True, with_exif=True, commit=True):
@@ -538,7 +607,7 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
         False prevail over those calculated from the content of the image.
         """
         # do not updating metadata while does not image exists
-        if not self.image:
+        if not self.image_file:
             return
 
         # create photo exif if not exist
@@ -553,14 +622,69 @@ class Photo(PhotoPermissionMixin, SoftDeleteModelMixin, models.Model):
             setattr(self.exif, k, v)
         self.exif.save()
 
+        # geoposition: latitude, longitude from exif
+        if self.latitude and self.longitude:
+            self.position = Geoposition(self.latitude, self.longitude)
+
         # commit changes
         if commit:
             self.save()
+
+    def generate_video_thumbnail(self, video_path):
+        """
+        If self.image is a video, generates its thumbnail and saves it in S3.
+
+        Returns True if thumbnail was created.
+        """
+        if not self.is_video:
+            logger.warning('File is not a video, thumbnail not generated')
+            return False
+
+        thumb_path = os.path.splitext(video_path)[0] + '.jpg'
+        thumb_name = os.path.basename(thumb_path)
+
+        try:
+            command = ['ffmpeg', '-i', video_path, '-an',
+                       '-ss', '1', '-t', '1', '-r', '1', '-y', thumb_path]
+            proc = subprocess.run(command,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  universal_newlines=True)
+        except FileNotFoundError:
+            logger.exception('ffmpeg binary is not in the PATH, thumbnail not generated.')
+            return False
+
+        if proc.returncode != 0:
+            logger.error(proc.stdout)
+            return False
+
+        try:
+            with open(thumb_path, 'rb') as f:
+                self.video_thumbnail = File(f, name=thumb_name)
+                self.save()
+        except Exception:
+            logger.exception('Error saving video thumbnail')
+            return False
+
+        try:
+            os.remove(thumb_path)
+        except Exception:
+            logger.exception('Error removing video thumbnail')
+
+        return True
 
     class Meta:
         verbose_name = _('Photo')
         verbose_name_plural = _('Photos')
         ordering = ('-modified_at', 'owner', )
+
+    def save(self, *args, **kwargs):
+        if self.position:
+            self.point = Point(
+                float(self.position.longitude),
+                float(self.position.latitude)
+            )
+        super().save(*args, **kwargs)
 
 
 class PhotoChunked(PhotoChunkPermissionMixin, ChunkedUpload):
@@ -575,6 +699,45 @@ class PhotoChunked(PhotoChunkPermissionMixin, ChunkedUpload):
         verbose_name = _('Photo chunk')
         verbose_name_plural = _('Photo chunks')
         ordering = ('-completed_at', '-status', '-created_at', )
+
+    def close_file(self):
+        """
+        Remove hack fix for Django 1.4.
+
+        https://github.com/juliomalegria/django-chunked-upload/commit/6889442c5ac86a68300f292f03fb93ca999ff583
+        """
+        self.file.close()
+
+    def open_file(self, mode='rb'):
+        """
+        Made FieldFile.open() respect its mode argument in Django < 1.11.
+
+        https://github.com/django/django/commit/ac1975b18b5a33234284bec86e5a5bb44a4af976
+        """
+        self.file._require_file()
+        if hasattr(self.file, '_file') and self.file._file is not None:
+            self.file.file.open(mode)
+        else:
+            self.file.file = self.file.storage.open(self.file.name, mode)
+
+    def append_chunk(self, chunk, chunk_size=None, save=True):
+        """
+        Override method to fix a bug opening the file.
+        """
+        self.close_file()
+        self.open_file(mode='ab')  # mode = append+binary
+        # We can use .read() safely because chunk is already in memory
+        self.file.write(chunk.read())
+        if chunk_size is not None:
+            self.offset += chunk_size
+        elif hasattr(chunk, 'size'):
+            self.offset += chunk.size
+        else:
+            self.offset = self.file.size
+        self._md5 = None  # Clear cached md5
+        if save:
+            self.save()
+        self.close_file()  # Flush
 
     @property
     def md5_missing_file(self):
@@ -608,7 +771,8 @@ class Gallery(GalleryPermissionMixin, AbstractTimestampModel):
     description = models.TextField(verbose_name=_('Description'), blank=True, default='')
     status = models.IntegerField(choices=STATUS_CHOICES, default=PRIVATE, verbose_name=_('Status'))
     photos = models.ManyToManyField(User, related_name='galleries', through='GalleryMembership')
-    cover = models.ForeignKey(Photo, blank=True, null=True, verbose_name=_('Cover'), related_name='covers_gallery')
+    cover = models.ForeignKey(Photo, blank=True, null=True, verbose_name=_('Cover'), related_name='covers_gallery',
+                              on_delete=models.RESTRICT)
 
     owners = models.ManyToManyField(User, related_name='user_galleries')
 
@@ -640,7 +804,7 @@ class GalleryMembership(GalleryMembershipPermissionMixin, models.Model):
     gallery = models.ForeignKey(Gallery, related_name='galleries_membership', on_delete=models.CASCADE)
 
     added_at = models.DateTimeField(auto_now_add=True, verbose_name=_('Addition date'))
-    added_by = models.ForeignKey(User, related_name='user_albums')
+    added_by = models.ForeignKey(User, related_name='user_albums', on_delete=models.RESTRICT)
 
 
 class DAMTaxonomy(TaxonomyPermissionMixin, CategoryBase):

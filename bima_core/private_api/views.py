@@ -1,22 +1,29 @@
 # -*- coding: utf-8 -*-
 
+from urllib import parse
+
+import coreapi
 from django.contrib.auth import get_user_model
 from django.utils.translation import ugettext as _i
+from django_filters import rest_framework as filters
 from drf_chunked_upload.views import ChunkedUploadView
 from drf_haystack.generics import HaystackGenericAPIView
 from dry_rest_permissions.generics import DRYPermissions
-from rest_framework import viewsets
+from rest_framework import viewsets, status
 from rest_framework.authtoken import views as auth_views
-from rest_framework.filters import DjangoFilterBackend
 from rest_framework.generics import ListAPIView as _ListAPIView, RetrieveAPIView as _RetrieveAPIView, \
-    CreateAPIView as _CreateAPIView, UpdateAPIView as _UpdateAPIView
+    CreateAPIView as _CreateAPIView, UpdateAPIView as _UpdateAPIView, GenericAPIView
 from rest_framework.mixins import CreateModelMixin, DestroyModelMixin, ListModelMixin
 from rest_framework.parsers import MultiPartParser
+from rest_framework.permissions import AllowAny
+from rest_framework.renderers import CoreJSONRenderer
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.schemas import AutoSchema
+from rest_framework.schemas import SchemaGenerator
+from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet
-from rest_framework_swagger.views import get_swagger_view
-
-from bima_core.models import Album, DAMTaxonomy, Gallery, GalleryMembership, Group, Photo, PhotoChunked, AccessLog, \
-    Copyright, UsageRight, PhotoAuthor, TaggedKeyword, TaggedName, PhotoType
+from rest_framework_swagger import renderers
 
 from .backends import HaystackDjangoFilterBackend
 from .filters import PhotoFilter, UserFilter, AlbumFilter, TaxonomyFilter, GalleryFilter, GroupFilter, \
@@ -28,9 +35,88 @@ from .serializers import GroupSerializer, UserSerializer, AlbumSerializer, Photo
     TaxonomyListSerializer, GallerySerializer, GalleryMembershipSerializer, AccessLogSerializer, \
     PhotoFlickrSerializer, PhotoChunkedSerializer, WhoAmISerializer, CopyrightSerializer, UsageRightSerializer, \
     PhotoAuthorSerializer, PhotoSearchSerializer, KeywordTagSerializer, NameTagSerializer, PhotoUpdateSerializer, \
-    BasePhotoSerializer, AuthTokenSerializer, PhotoTypeSerializer, TaxonomyLevelSerializer
+    BasePhotoSerializer, AuthTokenSerializer, PhotoTypeSerializer, TaxonomyLevelSerializer, YoutubeSerializer, \
+    VimeoSerializer, GalleryListSerializer, AlbumListSerializer
+from ..models import Album, DAMTaxonomy, Gallery, GalleryMembership, Group, Photo, PhotoChunked, AccessLog, \
+    Copyright, UsageRight, PhotoAuthor, TaggedKeyword, TaggedName, PhotoType
+from ..vimeo.models import VimeoAccount
+from ..vimeo.tasks import upload_video_vimeo
+from ..youtube.models import YoutubeChannel
+from ..youtube.tasks import upload_video_youtube
 
-schema_view = get_swagger_view(title=_i('BIMA Core: Private API'))
+
+class CustomSchema(AutoSchema):
+    def get_link(self, path, method, base_url):
+        """
+        Generate `coreapi.Link` for self.view, path and method.
+
+        This is the main _public_ access point.
+
+        Parameters:
+
+        * path: Route path for view from URLConf.
+        * method: The HTTP request method.
+        * base_url: The project "mount point" as given to SchemaGenerator
+        """
+        fields = self.get_path_fields(path, method)
+
+        fields += self.get_serializer_fields(path, method)
+        fields += self.get_pagination_fields(path, method)
+        if method == "GET" and 'id' not in path:
+            fields += self.get_filter_fields(path, method)
+
+        manual_fields = self.get_manual_fields(path, method)
+        fields = self.update_fields(fields, manual_fields)
+
+        if fields and any([field.location in ('form', 'body') for field in fields]):
+            encoding = self.get_encoding(path, method)
+        else:
+            encoding = None
+
+        description = self.get_description(path, method)
+
+        if base_url and path.startswith('/'):
+            path = path[1:]
+
+        return coreapi.Link(
+            url=parse.urljoin(base_url, path),
+            action=method.lower(),
+            encoding=encoding,
+            fields=fields,
+            description=description
+        )
+
+# schema views
+
+
+class CustomSwaggerUIRenderer(renderers.SwaggerUIRenderer):
+    template = 'swagger_index.html'
+
+
+class SwaggerSchemaViewBase(APIView):
+    """
+    BaseView for swagger schema views
+    """
+    permission_classes = [AllowAny]
+    renderer_classes = [
+        CoreJSONRenderer,
+        renderers.OpenAPIRenderer,
+        CustomSwaggerUIRenderer
+    ]
+    title = None
+    url = None
+    urlconf = None
+
+    def get(self, request):
+        generator = SchemaGenerator(title=self.title, url=self.url, urlconf=self.urlconf)
+        schema = generator.get_schema(request=request)
+        return Response(schema)
+
+
+class SwaggerPrivateSchemaView(SwaggerSchemaViewBase):
+    title = _i('BIMA: Private API')
+    url = '/private_api/'
+    urlconf = 'core.private_api.urls'
 
 
 # Base views
@@ -40,8 +126,9 @@ class PermissionMixin(object):
 
 
 class FilterMixin(object):
-    filter_backends = (DjangoFilterBackend, )
+    filter_backends = (filters.DjangoFilterBackend, )
     filter_class = NotImplementedError
+    schema = CustomSchema()
 
 
 class ViewSetSerializerMixin(object):
@@ -197,6 +284,11 @@ class PhotoSearchView(PermissionMixin, FilterMixin, ListModelMixin, HaystackGene
     def get(self, request, *args, **kwargs):
         return self.list(request, *args, **kwargs)
 
+    def filter_queryset(self, queryset):
+        queryset.model = Photo
+        for backend in list(self.filter_backends):
+            queryset = backend().filter_queryset(request=self.request, queryset=queryset, view=self)
+        return queryset
 
 # Api view sets
 
@@ -259,6 +351,16 @@ class AlbumViewSet(FilterModelViewSet):
     filter_backends = (FilterAlbumPermissionBackend, )
 
 
+class AlbumListViewSet(FilterMixin, ListAPIView):
+    """
+    API to list albums
+    """
+    serializer_class = AlbumListSerializer
+    queryset = Album.objects.active()
+    filter_class = AlbumFilter
+    filter_backends = (FilterAlbumPermissionBackend, )
+
+
 class PhotoViewSet(ViewSetSerializerMixin, FilterModelViewSet):
     """
     API to list, create, retrieve, update, delete photos
@@ -291,7 +393,7 @@ class PhotoViewSet(ViewSetSerializerMixin, FilterModelViewSet):
         return super().get_queryset().select_related(
             'exif', 'author', 'copyright', 'internal_usage_restriction', 'external_usage_restriction', 'owner', 'album'
         ).prefetch_related(
-            'categories', 'tagged_items', 'names', 'owner__groups'
+            'categories', 'tagged_items', 'names', 'owner__groups', 'album__owners',
         )
 
 
@@ -353,6 +455,15 @@ class GalleryViewSet(FilterModelViewSet):
     Update a gallery instance.
     """
     serializer_class = GallerySerializer
+    queryset = Gallery.objects.all()
+    filter_class = GalleryFilter
+
+
+class GalleryListViewSet(FilterMixin, ListAPIView):
+    """
+    API to list galleries
+    """
+    serializer_class = GalleryListSerializer
     queryset = Gallery.objects.all()
     filter_class = GalleryFilter
 
@@ -489,3 +600,93 @@ class PhotoTypeViewSet(FilterReadOnlyModelViewSet):
     serializer_class = PhotoTypeSerializer
     queryset = PhotoType.objects.all()
     filter_class = PhotoTypeFilter
+
+
+# Youtube related views
+
+
+class YoutubeChannelList(APIView):
+    """
+    API to list Youtube channels with photo and album info
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        photo_pk = kwargs['pk']
+        try:
+            photo = Photo.objects.filter(pk=photo_pk).only(
+                'id', 'title', 'album__id', 'album__title'
+            )[:1][0]
+        except IndexError:
+            content = {'detail': 'Photo not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        data = {'photo': photo, 'youtube_channels': YoutubeChannel.objects.all()}
+        serializer = YoutubeSerializer(data)
+        return Response(serializer.data)
+
+
+class YoutubeUpload(APIView):
+    """
+    API to upload video to Youtube in a background task
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request, *args, **kwargs):
+        photo_pk = kwargs['pk']
+        if not Photo.objects.filter(pk=photo_pk).exists():
+            content = {'detail': 'Photo not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        youtube_channel_pk = kwargs['channel_pk']
+        if not YoutubeChannel.objects.filter(pk=youtube_channel_pk).exists():
+            content = {'detail': 'Youtube channel not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        upload_video_youtube.delay(youtube_channel_pk, photo_pk)
+        return Response({'success': 'Youtube upload task started.'})
+
+
+# Vimeo related views
+
+
+class VimeoAccountList(APIView):
+    """
+    API to list Vimeo accounts with photo and album info
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        photo_pk = kwargs['pk']
+        try:
+            photo = Photo.objects.filter(pk=photo_pk).only(
+                'id', 'title', 'album__id', 'album__title'
+            )[:1][0]
+        except IndexError:
+            content = {'detail': 'Photo not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        data = {'photo': photo, 'vimeo_accounts': VimeoAccount.objects.all()}
+        serializer = VimeoSerializer(data)
+        return Response(serializer.data)
+
+
+class VimeoUpload(APIView):
+    """
+    API to upload video to Vimeo in a background task
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request, *args, **kwargs):
+        photo_pk = kwargs['pk']
+        if not Photo.objects.filter(pk=photo_pk).exists():
+            content = {'detail': 'Photo not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        vimeo_account_pk = kwargs['account_pk']
+        if not VimeoAccount.objects.filter(pk=vimeo_account_pk).exists():
+            content = {'detail': 'Youtube channel not found'}
+            return Response(content, status=status.HTTP_404_NOT_FOUND)
+
+        upload_video_vimeo.delay(vimeo_account_pk, photo_pk)
+        return Response({'success': 'Vimeo upload task started.'})

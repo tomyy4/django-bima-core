@@ -25,6 +25,9 @@ from bima_core.tasks import up_image_to_s3
 from bima_core.translation import TranslationMixin
 from bima_core.utils import belongs_to_admin_group, is_iterable, is_staff_or_superuser
 
+from ..vimeo.models import VimeoAccount
+from ..youtube.models import YoutubeAccount, YoutubeChannel
+
 from .fields import UserPermissionsField, PermissionField
 from .forms import PasswordResetForm
 
@@ -47,7 +50,7 @@ class ThumborSerializerMixin(object):
     thumbor_fieldsets = ()
 
     def get_thumbor_fieldsets(self):
-        """`
+        """
         Get thumbor fieldsets defined
         """
         if self.thumbor_fieldsets is None or not is_iterable(self.thumbor_fieldsets):
@@ -404,7 +407,8 @@ class BasePhotoSerializer(ValidatePermissionSerializer, ThumborSerializerMixin, 
 
     class Meta:
         model = Photo
-        fields = ('id', 'title', 'description', 'permissions', 'upload_status')
+        fields = ('id', 'title', 'description', 'permissions', 'upload_status',
+                  'file_type', 'youtube_code', 'vimeo_code', 'soundcloud_code')
 
 
 # Extra info serializers
@@ -626,12 +630,13 @@ class AlbumSerializer(ThumborSerializerMixin, TranslationSerializerMixin, BaseAl
     owners = serializers.PrimaryKeyRelatedField(queryset=get_user_model().objects.active(), many=True)
     photos = serializers.PrimaryKeyRelatedField(read_only=True, source='photos_album', many=True)
     cover = serializers.PrimaryKeyRelatedField(queryset=Photo.objects.active(), required=False)
-    extra_info = serializers.SerializerMethodField(read_only=True)
+    extra_info = serializers.SerializerMethodField()
     permissions = PermissionField()
+    image_file_type = serializers.SerializerMethodField()
 
     class Meta(BaseAlbumSerializer.Meta):
         fields = ('id', 'title', 'description', 'slug', 'created_at', 'modified_at', 'owners', 'photos', 'extra_info',
-                  'cover', 'permissions', )
+                  'cover', 'permissions', 'image_file_type')
 
     def get_thumbor_fieldsets(self):
         """
@@ -645,12 +650,29 @@ class AlbumSerializer(ThumborSerializerMixin, TranslationSerializerMixin, BaseAl
         """
         return AlbumExtraInfoSerializer(obj, read_only=True, context=self.context).data
 
+    def get_image_file_type(self, obj):
+        """
+        Returns the file type of the gallery image used as cover.
+        """
+        photo = obj.photo
+        return photo and photo.file_type
+
     def validate_cover(self, value):
         if not self.instance.photos_album.filter(id=value.id).exists():
             raise ValidationError(
                 _('Invalid pk "{pk}" - photo does not exist into current album.'.format(pk=value.id)), code='cover'
             )
         return value
+
+
+class AlbumListSerializer(TranslationSerializerMixin, serializers.ModelSerializer):
+    """
+    Album list serializer.
+    """
+
+    class Meta:
+        model = Album
+        fields = ('id', 'title', 'description', )
 
 
 class GallerySerializer(ThumborSerializerMixin, TranslationSerializerMixin, serializers.ModelSerializer):
@@ -661,13 +683,15 @@ class GallerySerializer(ThumborSerializerMixin, TranslationSerializerMixin, seri
 
     owners = serializers.PrimaryKeyRelatedField(queryset=get_user_model().objects.active(), many=True)
     cover = serializers.PrimaryKeyRelatedField(queryset=Photo.objects.active(), required=False)
-    extra_info = serializers.SerializerMethodField(read_only=True)
+    extra_info = serializers.SerializerMethodField()
     permissions = PermissionField()
+    image_file_type = serializers.SerializerMethodField()
+    photos = serializers.SerializerMethodField()
 
     class Meta:
         model = Gallery
         fields = ('id', 'title', 'description', 'slug', 'photos', 'status', 'created_at', 'modified_at', 'owners',
-                  'extra_info', 'cover', 'permissions', )
+                  'extra_info', 'cover', 'permissions', 'image_file_type')
 
     def get_thumbor_fieldsets(self):
         """
@@ -681,12 +705,35 @@ class GallerySerializer(ThumborSerializerMixin, TranslationSerializerMixin, seri
         """
         return GalleryExtraInfoSerializer(obj, read_only=True, context=self.context).data
 
+    def get_image_file_type(self, obj):
+        """
+        Returns the file type of the gallery image used as cover.
+        """
+        photo = obj.photo
+        return photo and photo.file_type
+
+    def get_photos(self, obj):
+        """
+        Returns no repeated ids
+        """
+        return obj.photos.all().distinct().values_list('id', flat=True)
+
     def validate_cover(self, value):
         if not self.instance.galleries_membership.filter(photo_id=value.id).exists():
             raise ValidationError(
                 _('Invalid pk "{pk}" - photo does not exist into current gallery.'.format(pk=value.id)), code='cover'
             )
         return value
+
+
+class GalleryListSerializer(TranslationSerializerMixin, serializers.ModelSerializer):
+    """
+    Gallery list serializer.
+    """
+
+    class Meta:
+        model = Gallery
+        fields = ('id', 'title', 'description', )
 
 
 class GalleryMembershipSerializer(ValidatePermissionSerializer, serializers.ModelSerializer):
@@ -764,7 +811,7 @@ class TaxonomyLevelSerializer(TaxonomySerializer):
     Like TaxonomySerializer but without recursive children.
     """
     class Meta(BaseTaxonomySerializer.Meta):
-        fields = ('id', 'name', 'slug', 'parent', 'ancestors', 'extra_info', 'permissions', )
+        fields = ('id', 'name', 'slug', 'parent', 'extra_info', 'permissions', )
 
 
 class AccessLogSerializer(serializers.ModelSerializer):
@@ -809,7 +856,10 @@ class PhotoSerializer(BasePhotoSerializer):
     categories = serializers.PrimaryKeyRelatedField(queryset=DAMTaxonomy.objects.active(), required=False, many=True)
     keywords = KeywordSerializer(required=False, many=True)
     names = NameSerializer(required=False)
-    extra_info = serializers.SerializerMethodField(read_only=True)
+    extra_info = serializers.SerializerMethodField()
+    download_permission = serializers.SerializerMethodField(method_name='has_download_permission')
+    can_upload_youtube = serializers.SerializerMethodField()
+    can_upload_vimeo = serializers.SerializerMethodField()
 
     class Meta:
         model = Photo
@@ -818,7 +868,8 @@ class PhotoSerializer(BasePhotoSerializer):
                   'altitude', 'owner', 'categories', 'keywords', 'created_at', 'modified_at', 'album', 'extra_info',
                   'permissions', 'image_flickr', 'names', 'copyright', 'author', 'internal_usage_restriction',
                   'external_usage_restriction', 'identifier', 'original_file_name', 'categorize_date', 'size',
-                  'upload_status')
+                  'upload_status', 'file_type', 'youtube_code', 'vimeo_code', 'soundcloud_code', 'download_permission',
+                  'can_upload_youtube', 'can_upload_vimeo')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -835,7 +886,7 @@ class PhotoSerializer(BasePhotoSerializer):
         """
         thumbor_fields = {'thumbnail', 'small_fit'}
         # if user who request has download permission will receive all photo sizes
-        if self._has_download_permission():
+        if self.has_download_permission():
             thumbor_fields |= {'small', 'medium', 'original', 'large', }
         return ((None, 'image'), thumbor_fields),
 
@@ -845,9 +896,15 @@ class PhotoSerializer(BasePhotoSerializer):
         has download permission
         """
         field_names = super().get_field_names(declared_fields, info)
-        if self._has_download_permission():
+        if self.has_download_permission():
             field_names.append('image_file')
         return field_names
+
+    def get_can_upload_youtube(self, obj):
+        return YoutubeChannel.configured_channel_exist()
+
+    def get_can_upload_vimeo(self, obj):
+        return VimeoAccount.objects.exists()
 
     def validate(self, attrs):
         """
@@ -897,7 +954,7 @@ class PhotoSerializer(BasePhotoSerializer):
         """
         return PhotoExtraInfoSerializer(obj, read_only=True, context=self.context).data
 
-    def _has_download_permission(self):
+    def has_download_permission(self, obj=None):
         """
         Validate if the user who requests the photo has permission to download it
         """
@@ -1038,3 +1095,58 @@ class PhotoFlickrSerializer(ReadOnlyFieldMixin, PhotoSerializer):
             self.request.user, validated_data['album'], validated_data['photo'],
             validated_data['author'], validated_data['copyright']
         )
+
+
+# Youtube serializers
+
+
+class YoutubeAccountSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = YoutubeAccount
+        fields = ('username',)
+        read_only_fields = fields
+
+
+class YoutubeChannelSerializer(serializers.ModelSerializer):
+    account = YoutubeAccountSerializer()
+
+    class Meta:
+        model = YoutubeChannel
+        fields = ('id', 'name', 'channel_id', 'account')
+        read_only_fields = fields
+
+
+class AlbumYoutubeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Album
+        fields = ('id', 'title')
+        read_only_fields = fields
+
+
+class PhotoYoutubeSerializer(serializers.ModelSerializer):
+    album = AlbumYoutubeSerializer()
+
+    class Meta:
+        model = Photo
+        fields = ('id', 'title', 'album')
+        read_only_fields = fields
+
+
+class YoutubeSerializer(serializers.Serializer):
+    photo = PhotoYoutubeSerializer()
+    youtube_channels = YoutubeChannelSerializer(many=True)
+
+
+# Vimeo serializers
+
+
+class VimeoAccountSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VimeoAccount
+        fields = ('id', 'name', 'username')
+        read_only_fields = fields
+
+
+class VimeoSerializer(serializers.Serializer):
+    photo = PhotoYoutubeSerializer()
+    vimeo_accounts = VimeoAccountSerializer(many=True)
