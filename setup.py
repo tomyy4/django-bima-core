@@ -48,7 +48,7 @@ os.chdir(os.path.normpath(os.path.join(os.path.abspath(__file__), os.pardir)))
 
 setup(
     name='django-bima-core',
-    version='0.8.1-fork',
+    version='0.8.1+fork',
     packages=find_packages(exclude=['tests_project.*', 'tests_project']),
     include_package_data=True,
     license='GPLv3',
